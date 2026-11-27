@@ -35,6 +35,18 @@ Run the scripts in order in the same R session.
 3. Use the bundled species data. To refresh the GBIF records, install `spocc` and `rgbif`, then run [`R/species_data.R`](R/species_data.R).
 4. Create `outputs/plant/` or `outputs/cat/`, then run [`R/modelling_plant.R`](R/modelling_plant.R) or [`R/modelling_cat.R`](R/modelling_cat.R) to fit and project the corresponding ensemble. The cat example may take longer to run.
 
+## Usage
+
+Use `model_data` and `covar_rast` from either modelling script, or supply a training data frame and a `SpatRaster` of predictors. The training data should contain an `occ` column coded as 0 or 1 and one column per predictor. Match the raster layer names to the predictor columns.
+
+```r
+source("R/models.R")
+
+model <- ensemble(x = model_data, y = "occ")
+suitability <- terra::predict(covar_rast, model, na.rm = TRUE)
+terra::plot(suitability)
+```
+
 ## Evaluation and outputs
 
 Both examples use five-fold spatial block cross-validation and report ROC AUC, area under the precision–recall curve, and the Boyce index. They then refit the ensemble using all available records. The ensemble scales each model's predictions to 0–1 using its training prediction range, then averages the scaled scores. It reuses those ranges for all three periods.
