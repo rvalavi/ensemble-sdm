@@ -88,7 +88,6 @@ pred_current <- terra::predict(
   model = model,
   type = "response",
   cpkgs = c(
-    "ranger",
     "dismo",
     "gbm",
     "mgcv",

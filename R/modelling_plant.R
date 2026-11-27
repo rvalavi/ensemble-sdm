@@ -141,7 +141,6 @@ pred_current <- terra::predict(
     model = model,
     type = "response",
     cpkgs = c(
-        "ranger",
         "dismo",
         "gbm",
         "mgcv",
@@ -177,7 +176,6 @@ pred_f1 <- terra::predict(
     model = model,
     type = "response",
     cpkgs = c(
-        "ranger",
         "dismo",
         "gbm",
         "mgcv",
@@ -213,7 +211,6 @@ pred_f2 <- terra::predict(
     model = model,
     type = "response",
     cpkgs = c(
-        "ranger",
         "dismo",
         "gbm",
         "mgcv",

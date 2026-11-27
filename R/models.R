@@ -1,6 +1,5 @@
 # install required packages
 pkg <- c(
-    "ranger",
     "dismo",
     "gbm",
     "mgcv",
@@ -22,7 +21,6 @@ if (length(pkgna)) {
 # remotes::install_github("rvalavi/myspatial")
 # library(myspatial)
 suppressPackageStartupMessages({
-    library(ranger)
     library(dismo)
     library(gbm)
     library(mgcv)
@@ -36,7 +34,7 @@ suppressPackageStartupMessages({
 update_names <- function(x, y, k = 4, thr = 20) {
     z <- as.numeric(
         which(
-            apply(x[, y], 2, function(t) length(unique(t)) < thr)
+            apply(x[, y, drop = FALSE], 2, function(t) length(unique(t)) < thr)
         )
     )
     
@@ -55,13 +53,18 @@ update_names <- function(x, y, k = 4, thr = 20) {
 #
 # x data.frame of the training data.
 # y character, the column name of the response
+# use_ranger logical, use ranger instead of randomForest for the RF component
+# balance_classes logical, draw equal numbers of both classes per RF tree
 ensemble <- function(
         x,
         y = "",
         fold_ids = NULL,
-        models = c("GLM", "GAM", "GBM", "RF", "Maxent")
+        models = c("GLM", "GAM", "GBM", "RF", "Maxent"),
+        use_ranger = FALSE,
+        balance_classes = TRUE
 ) {
     
+    x <- as.data.frame(x)
     # get covariate names
     covars <- names(x)
     covars <- covars[covars != y]
@@ -72,8 +75,11 @@ ensemble <- function(
     
     # if null use all
     if (is.null(models)) models <- c("GLM", "GAM", "GBM", "RF", "Maxent")
-    if (tolower(models)[1] == "all") models <- c("GLM", "GAM", "GBM", "RF", "Maxent")
+    if (identical(tolower(models)[1], "all")) models <- c("GLM", "GAM", "GBM", "RF", "Maxent")
     models <- tolower(models)
+    if (!any(models %in% c("glm", "gam", "gbm", "rf", "maxent"))) {
+        stop("Select at least one supported ensemble model.", call. = FALSE)
+    }
     
     # set the default to null
     ls_mod <- gm_mod <- br_mod <- rf_mod <- mx_mod <- quad_obj <- NULL
@@ -89,7 +95,7 @@ ensemble <- function(
         quad_obj <- make_quadratic(x, cols = covars)
         training_quad <- predict(quad_obj, newdata = x)
         new_vars <- names(training_quad)[names(training_quad) != y]
-        training_sparse <- sparse.model.matrix(~., training_quad[, new_vars])
+        training_sparse <- Matrix::sparse.model.matrix(~., training_quad[, new_vars, drop = FALSE])
         
         ls_mod <- glmnet::cv.glmnet(
             x = training_sparse,
@@ -129,23 +135,28 @@ ensemble <- function(
     
     
     if ("gbm" %in% models) {
-        message("Fitting GBM...")
-        # fit boosted regression tress (BRT) a.k.a GBM
-        br_mod <- dismo::gbm.step(
-            data = x,
-            gbm.y = which(names(x) == y),
-            gbm.x = which(names(x) != y),
-            family = "bernoulli",
-            tree.complexity = ifelse(num_pr < 50, 1, 5),
-            learning.rate = 0.001,
-            bag.fraction = 0.75,
-            max.trees = 10000,
-            n.trees = 50,
-            site.weights = case_weights,
-            fold.vector = fold_ids,
-            n.folds = length(unique(fold_ids)),
-            silent = TRUE
-        )
+        for (learning_rate in c(0.001, 0.0005, 0.00025)) {
+            message("Fitting GBM (learning rate ", learning_rate, ")...")
+            br_mod <- dismo::gbm.step(
+                data = x,
+                gbm.y = which(names(x) == y),
+                gbm.x = which(names(x) != y),
+                family = "bernoulli",
+                tree.complexity = ifelse(num_pr < 50, 1, 5),
+                learning.rate = learning_rate,
+                bag.fraction = 0.75,
+                max.trees = 10000,
+                n.trees = 50,
+                site.weights = case_weights,
+                fold.vector = fold_ids,
+                n.folds = length(unique(fold_ids)),
+                silent = TRUE
+            )
+            if (!is.null(br_mod)) break
+        }
+        if (is.null(br_mod)) {
+            stop("GBM fitting failed at all three learning rates.", call. = FALSE)
+        }
     }
     
     
@@ -155,22 +166,17 @@ ensemble <- function(
             length(covars)
         )
     )
-    # NOTE: this RF is for binary classification with down-sampling
+    # RF for binary classification
     if ("rf" %in% models) {
-        message("Fitting RF with down-sampling...")
-        # fit random forest down-sampled with ranger
         rf_mod <- random_forest(
             data = x,
             y = y,
             splitrule = c("gini", "hellinger"),
-            num.trees = 1000, # enough trees to learn with balanced trees
-            mtry = 2:(min(length(covars), max(5, sqrt_vars))),
-            # max.depth = NULL, # allow full depth for down-sampling
+            num.trees = 1000,
+            mtry = seq.int(min(2, length(covars)), min(length(covars), max(5, sqrt_vars))),
             foldid = fold_ids,
-            sample.fraction = num_pr / num_bg, # for down-sampling
-            case.weights = case_weights, # for down-sampling
-            threads = NULL, # full treads
-            plot = TRUE
+            balance_classes = balance_classes,
+            use_ranger = use_ranger
         )
     }
     
@@ -182,16 +188,14 @@ ensemble <- function(
         param_optim <- maxent_param(
             data = x,
             y = y,
-            folds = fold_ids,
+            folds = fold_ids
         )
         print(param_optim)
         
         # fit a maxent model with the tuned parameters
         mx_mod <- dismo::maxent(
-            x = x[, covars],
-            p = x[, y, drop = TRUE],
-            removeDuplicates = FALSE,
-            path = tempdir(),
+            x = x[, covars, drop = FALSE],
+            p = x[[y]],
             args = param_optim
         )
         
@@ -206,7 +210,20 @@ ensemble <- function(
         "quad" = quad_obj
     )
     class(out) <- c("ensemble", "list")
-    
+
+    # Fit the scale on training predictions and reuse it for every projection.
+    training_predictions <- predict(out, x[, covars, drop = FALSE], .components = TRUE)
+    valid <- colSums(!is.finite(training_predictions)) == 0L
+    if (any(!valid)) {
+        stop(
+            "Non-finite training predictions from: ",
+            paste(colnames(training_predictions)[!valid], collapse = ", "),
+            call. = FALSE
+        )
+    }
+    attr(out, "predictors") <- covars
+    attr(out, "prediction_ranges") <- apply(training_predictions, 2, range)
+
     return(out)
 }
 
@@ -219,63 +236,85 @@ print.ensemble <- function(x, ...){
 }
 
 # predict with ensemble object
-predict.ensemble <- function(object, newdata, ...){
-    require(ranger)
-    require(dismo)
-    require(gbm)
-    require(mgcv)
-    require(glmnet)
-    
-    pred_ls <- pred_gm <- pred_rf <- pred_br <- pred_mx <- NA
-    
-    # predict lasso with the 1 sd lambda
+predict.ensemble <- function(object, newdata, type = "response", ..., .components = FALSE){
+    newdata <- as.data.frame(newdata)
+    ranges <- attr(object, "prediction_ranges")
+    if (!is.null(ranges)) {
+        if (!identical(type, "response")) {
+            stop("The scaled ensemble only supports type = 'response'.", call. = FALSE)
+        }
+        newdata <- newdata[, attr(object, "predictors"), drop = FALSE]
+        complete <- complete.cases(newdata)
+        result <- rep(NA_real_, nrow(newdata))
+        if (!any(complete)) return(result)
+        newdata <- newdata[complete, , drop = FALSE]
+    }
+
+    pred_ls <- pred_gm <- pred_rf <- pred_br <- pred_mx <- NULL
+
+    # predict lasso with the minimum-error lambda
     if (!is.null(object[["GLM-Lasso"]])) {
         pred_quad <- predict(object[["quad"]], newdata = newdata)
-        pred_sparse <- sparse.model.matrix(~., pred_quad)
-        pred_ls <- predict(object[["GLM-Lasso"]], pred_sparse, s = "lambda.min", ...)[, 1]
+        pred_sparse <- Matrix::sparse.model.matrix(~., pred_quad)
+        pred_ls <- predict(object[["GLM-Lasso"]], pred_sparse, s = "lambda.min", type = type, ...)[, 1]
     }
-    
+
     # predict gam model
     if (!is.null(object[["GAM"]])) {
-        pred_gm <- predict(object[["GAM"]], newdata, ...)
+        pred_gm <- predict(object[["GAM"]], newdata, type = type, ...)
     }
-    
+
     # predict brt with the best tree number
     brt <- object[["GBM"]]
     if (!is.null(brt)) {
-        pred_br <- predict(brt, newdata, n.trees = brt$gbm.call$best.trees, ...)
+        pred_br <- predict(brt, newdata, n.trees = brt$gbm.call$best.trees, type = type, ...)
     }
-    
-    # predict rf with ranger
-    if (!is.null(object[["RF"]])) {
-        pred_rf <- predict(object[["RF"]], newdata, num.threads = 5, ...)$predictions[,"1"]
+
+    # predict rf with the fitted backend
+    rf <- object[["RF"]]
+    if (inherits(rf, "ranger")) {
+        loadNamespace("ranger")
+        pred_rf <- predict(rf, newdata, type = type, num.threads = 5, ...)$predictions[, "1"]
+    } else if (!is.null(rf)) {
+        loadNamespace("randomForest")
+        pred_rf <- predict(rf, newdata, type = "prob", ...)[, "1"]
     }
-    
-    # predict brt with the best tree number
+
+    # predict maxent on the cloglog scale
     mxt <- object[["Maxent"]]
     if (!is.null(mxt)) {
-        pred_mx <- predict(mxt, newdata, type = "cloglog")
+        pred_mx <- dismo::predict(mxt, newdata, args = "outputformat=cloglog")
     }
-    
-    out <- data.frame(
-        l = pred_ls,
-        g = pred_gm,
-        r = pred_rf,
-        b = pred_br,
-        x = pred_mx
+
+    out <- cbind(
+        "GLM-Lasso" = pred_ls,
+        "GAM" = pred_gm,
+        "GBM" = pred_br,
+        "RF" = pred_rf,
+        "Maxent" = pred_mx
     )
-    
-    return(
-        rowMeans(out, na.rm = TRUE)
-    )
+
+    if (.components) return(out)
+    if (is.null(ranges)) return(rowMeans(out, na.rm = TRUE))
+
+    out[!is.finite(out)] <- NA_real_
+    spans <- ranges[2, ] - ranges[1, ]
+    constant <- spans == 0
+    spans[constant] <- 1
+    scaled <- sweep(sweep(out, 2, ranges[1, ], "-"), 2, spans, "/")
+    # Use the midpoint when a component has a constant training score.
+    scaled[, constant] <- ifelse(is.na(scaled[, constant, drop = FALSE]), NA_real_, 0.5)
+    result[complete] <- rowMeans(pmax(pmin(scaled, 1), 0))
+    return(result)
 }
 
 
 # function for simultaneous tuning of maxent regularization multiplier and features
 maxent_param <- function(data, y = "occ", folds = NULL, k = 5, filepath = tempdir()){
-    require(dismo)
-    require(precrec)
-    
+    if (!isTRUE(dismo::maxent(silent = TRUE))) {
+        stop("MaxEnt requires rJava and a working Java runtime.", call. = FALSE)
+    }
+
     if(is.null(folds)){
         # generate balanced CV folds
         folds <- dismo::kfold(data[, y, drop = TRUE], k = k)
@@ -294,41 +333,50 @@ maxent_param <- function(data, y = "occ", folds = NULL, k = 5, filepath = tempdi
             c("noautofeature", "nothreshold", "noquadratic", "nohinge", "noproduct")), # L
         stringsAsFactors = FALSE
     )
-    AUCs <- c()
-    for(n in seq_along(grid[,1])){
-        
-        full_pred <- data.frame()
-        nfold <- sort(unique(folds))
-        
-        for(k in nfold){
+    AUCs <- rep(NA_real_, nrow(grid))
+    nfold <- sort(unique(folds))
+    last_error <- NULL
+    for (n in seq_len(nrow(grid))) {
+        parameters <- as.character(unlist(grid[n, ]))
+        scores <- rep(NA_real_, nrow(data))
+
+        for (k in nfold) {
             train_set <- which(folds != k)
             test_set <- which(folds == k)
-            if(inherits(try(
-                maxmod <- dismo::maxent(x = data[train_set, covars],
-                                        p = data$occ[train_set],
-                                        removeDuplicates = FALSE,
-                                        path = filepath,
-                                        args = as.character(unlist(grid[n, ]))
+            fit_path <- tempfile("maxent-", tmpdir = filepath)
+            fold_scores <- tryCatch({
+                maxmod <- dismo::maxent(
+                    x = data[train_set, covars, drop = FALSE],
+                    p = data$occ[train_set],
+                    path = fit_path,
+                    args = parameters
                 )
-            ), "try-error")){
-                next
+                dismo::predict(
+                    maxmod, data[test_set, covars, drop = FALSE], args = "outputformat=cloglog"
+                )
+            }, error = function(error) error, finally = unlink(fit_path, recursive = TRUE))
+            if (inherits(fold_scores, "error")) {
+                last_error <- conditionMessage(fold_scores)
+                break
             }
-            mod_pred <- predict(maxmod, data[test_set, covars], args = "outputformat=cloglog")
-            pred_df <- data.frame(score = mod_pred, label = data$occ[test_set])
-            full_pred <- rbind(full_pred, pred_df)
+            scores[test_set] <- fold_scores
         }
-        
-        AUCs[n] <- precrec::auc(
-            precrec::evalmod(scores = full_pred$score, labels = full_pred$label)
-        )[1, 4]
+
+        if (all(is.finite(scores))) {
+            AUCs[n] <- precrec::auc(precrec::evalmod(scores = scores, labels = data$occ))[1, 4]
+        }
+    }
+    if (all(is.na(AUCs))) {
+        detail <- if (is.null(last_error)) "" else paste0(" Last error: ", last_error)
+        stop("No MaxEnt candidate completed cross-validation.", detail, call. = FALSE)
     }
     best_param <- as.character(unlist(grid[which.max(AUCs), ]))
-    
+
     return(best_param)
 }
 
 
-# tune parameters in ranger mode
+# Tune and refit the selected random forest backend.
 random_forest <- function(data, 
                           y = "occ", 
                           splitrule = c("gini", "hellinger", "extratrees"),
@@ -341,11 +389,24 @@ random_forest <- function(data,
                           case.weights = NULL, 
                           type = "response",
                           threads = NULL,
-                          plot = TRUE){
-    
-    require(ranger)
-    require(ggplot2)
-    
+                          plot = TRUE,
+                          balance_classes = FALSE,
+                          use_ranger = TRUE){
+    if (!is.logical(use_ranger) || length(use_ranger) != 1L || is.na(use_ranger)) {
+        stop("use_ranger must be TRUE or FALSE.", call. = FALSE)
+    }
+    if (!is.logical(balance_classes) || length(balance_classes) != 1L || is.na(balance_classes)) {
+        stop("balance_classes must be TRUE or FALSE.", call. = FALSE)
+    }
+
+    package <- if (use_ranger) "ranger" else "randomForest"
+    if (!length(find.package(package, quiet = TRUE))) {
+        message("Installing packages: ", package, "...")
+        utils::install.packages(package)
+    }
+    message("Fitting RF with ", package, "...")
+
+    predictors <- setdiff(names(data), y)
     form <- as.formula(
         paste(y, "~ .")
     )
@@ -358,7 +419,7 @@ random_forest <- function(data,
         mtry <- floor(sqrt(ncol(data) - 1))
     }
     
-    grid <- expand.grid(split = splitrule,
+    grid <- expand.grid(split = if (use_ranger) splitrule else "gini",
                         ntrees = num.trees,
                         mtry = mtry,
                         # depth = max.depth, 
@@ -369,7 +430,54 @@ random_forest <- function(data,
     }
     nfold <- sort(unique(foldid))
     
-    evalmodel <- data.frame(split = rep(NA, nrow(grid)), ntrees = NA)
+    fit_forest <- function(training, params, weights) {
+        response <- training[[y]]
+        if (balance_classes) {
+            presences <- sum(response == "1")
+            backgrounds <- sum(response == "0")
+            if (presences == 0L || backgrounds == 0L) {
+                stop("Balanced RF fitting requires presences and backgrounds in every training fold.",
+                     call. = FALSE)
+            }
+        }
+
+        if (!use_ranger) {
+            if (balance_classes) {
+                # randomForest caps each stratum's sample size at its observed count.
+                draws <- min(presences, backgrounds)
+                sampsize <- c("0" = draws, "1" = draws)
+            } else {
+                sampsize <- max(1L, floor(sample.fraction * nrow(training)))
+            }
+            return(randomForest::randomForest(
+                x = training[, predictors, drop = FALSE],
+                y = response,
+                ntree = params$ntrees,
+                mtry = params$mtry,
+                sampsize = sampsize,
+                weights = weights,
+                replace = TRUE
+            ))
+        }
+
+        # ranger uses fractions of the entire training set for each class.
+        fraction <- if (balance_classes) rep(presences / nrow(training), 2) else sample.fraction
+        ranger::ranger(
+            formula = form,
+            data = training,
+            num.trees = params$ntrees,
+            mtry = params$mtry,
+            splitrule = params$split,
+            probability = probability,
+            sample.fraction = fraction,
+            case.weights = weights,
+            num.threads = threads,
+            replace = TRUE
+        )
+    }
+
+    evalmodel <- grid
+    evalmodel$eval <- NA_real_
     for(i in seq_along(grid[,1])){
         modauc <- c()
         for(k in nfold){
@@ -377,29 +485,17 @@ random_forest <- function(data,
             train_set <- which(foldid != k)
             test_set <- which(foldid == k)
             
-            mod <- ranger::ranger(
-                formula = form,
-                data = data[train_set, ], 
-                num.trees = grid$ntrees[i],
-                splitrule = grid$split[i],
-                # max.depth = grid$depth[i],
-                mtry = grid$mtry[i],
-                probability = probability,
-                sample.fraction = sample.fraction,
-                case.weights = case.weights[train_set],
-                num.threads = threads,
-                replace = TRUE
-            )
-            
-            pred <- predict(mod, data[test_set, ], type = type)$predictions[, "1"]
-            modauc[k] <- precrec::auc(
-                precrec::evalmod(scores = pred, labels = data[test_set, y, drop=TRUE])
-            )[1,4]
+            mod <- fit_forest(data[train_set, , drop = FALSE], grid[i, ], case.weights[train_set])
+            test_data <- data[test_set, predictors, drop = FALSE]
+            if (use_ranger) {
+                pred <- predict(mod, test_data, type = type)$predictions[, "1"]
+            } else {
+                pred <- predict(mod, test_data, type = "prob")[, "1"]
+            }
+            modauc <- c(modauc, precrec::auc(
+                precrec::evalmod(scores = pred, labels = data[test_set, y, drop = TRUE])
+            )[1, 4])
         }
-        # evalmodel$depth[i] <- grid$max.depth[i]
-        evalmodel$split[i] <- grid$split[i]
-        evalmodel$ntrees[i] <- grid$ntrees[i]
-        evalmodel$mtry[i] <- grid$mtry[i]
         evalmodel$eval[i] <- mean(modauc)
     }
     
@@ -412,20 +508,8 @@ random_forest <- function(data,
     # }
     print(evalmodel[bestparam, ])
     
-    final_model <- ranger::ranger(
-        formula = form,
-        data = data, 
-        num.trees = evalmodel$ntrees[bestparam],
-        mtry = evalmodel$mtry[bestparam],
-        splitrule = evalmodel$split[bestparam],
-        # max.depth = evalmodel$depth[bestparam],
-        probability = probability,
-        sample.fraction = sample.fraction,
-        case.weights = case.weights,
-        num.threads = threads,
-        replace = TRUE
-    )
-    
+    final_model <- fit_forest(data, grid[bestparam, ], case.weights)
+
     return(final_model)
 }
 
@@ -461,19 +545,20 @@ make_quadratic <- function(df, cols = NULL, verbose = TRUE){
     if(is.numeric(cols)){
         cols <- colnames(df)[cols]
     }
-    # remove the factors
-    if(any(sapply(df[,cols], is.factor))){
-        if(verbose){
-            message("The factor columns were removed form cols: ", cols[which(sapply(df[,cols], is.factor))])
-        }
-        cols <- cols[-which(sapply(df[,cols], is.factor))]
-    }
     if(!all(is.element(cols, colnames(df)))){
         stop("The cols should be the same as the column names.")
     }
-    xbar <- apply(df[,cols], 2, mean)
-    x1 <- data.frame(mapply(`-`, df[,cols], xbar, SIMPLIFY = FALSE))
-    alpha <- colSums(x1 ^ 3) / colSums(x1 ^ 2)
+    # remove the factors
+    factors <- vapply(df[cols], is.factor, logical(1))
+    if(any(factors) && verbose){
+        message("The factor columns were removed from cols: ", paste(cols[factors], collapse = ", "))
+    }
+    cols <- cols[!factors]
+    xbar <- vapply(df[cols], mean, numeric(1))
+    x1 <- data.frame(mapply(`-`, df[cols], xbar, SIMPLIFY = FALSE))
+    sum_squares <- colSums(x1 ^ 2)
+    sum_squares[sum_squares == 0] <- 1
+    alpha <- colSums(x1 ^ 3) / sum_squares
     # specify the output class
     finalList <- list(names = cols, xbars = xbar, alphas = alpha)
     class(finalList) <- c("make_quadratic")
